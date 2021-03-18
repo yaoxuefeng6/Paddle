@@ -151,8 +151,21 @@ void PSGPUWrapper::BuildTask(std::shared_ptr<HeterContext> gpu_task,
   timeline.Pause();
   VLOG(1) << "GpuPs pull sparse cost " << timeline.ElapsedSec() << " seconds.";
 
+  auto gloo_wrapper = paddle::framework::GlooWrapper::GetInstance();
+
+  if (!gloo_wrapper->IsInitialized()) {
+    VLOG(0) << "GLOO is not inited";
+    gloo_wrapper->Init();
+  }
+  gloo_wrapper->Barrier();
+
   timeline.Start();
-  auto build_func = [device_num, &local_keys, &local_ptr, &device_keys,
+  std::vector<std::vector<std::pair<uint64_t, char*>>> pass_values;
+  uint16_t pass_id = 0;
+
+  auto record_status = fleet_ptr->pslib_ptr_->_worker_ptr->take_sparse_record(table_id, pass_id, pass_values);
+
+  auto build_func = [device_num, record_status, &pass_values, &local_keys, &local_ptr, &device_keys,
                      &device_vals, &device_mutex](int i) {
     std::vector<std::vector<FeatureKey>> task_keys(device_num);
     std::vector<std::vector<paddle::ps::DownpourFixedFeatureValue*>> task_ptrs(
@@ -164,20 +177,31 @@ void PSGPUWrapper::BuildTask(std::shared_ptr<HeterContext> gpu_task,
       task_ptrs[shard].push_back(local_ptr[i][j]);
     }
 
+    if (record_status) {
+      size_t local_keys_size = local_keys.size();
+      size_t pass_values_size = pass_values.size();
+      for (size_t j = 0; j < pass_values_size; j += local_keys_size) {
+        auto& shard_values = pass_values[j];
+        for (size_t pair_idx = 0; pair_idx < pass_values[j].size(); pair_idx++) {
+          auto& cur_pair = shard_values[pair_idx];
+          int shard = cur_pair.first % device_num;
+          task_keys[shard].push_back(cur_pair.first);
+          task_ptrs[shard].push_back((paddle::ps::DownpourFixedFeatureValue*)cur_pair.second);
+        }
+      }
+    }
+
     for (int dev = 0; dev < device_num; dev++) {
       device_mutex[dev]->lock();
-
       int len = task_keys[dev].size();
       int cur = device_keys[dev].size();
       device_keys[dev].resize(device_keys[dev].size() + len);
       device_vals[dev].resize(device_vals[dev].size() + len);
-
       for (int j = 0; j < len; ++j) {
         device_keys[dev][cur + j] = task_keys[dev][j];
         float* ptr_val = task_ptrs[dev][j]->data();
         FeatureValue& val = device_vals[dev][cur + j];
         size_t dim = task_ptrs[dev][j]->size();
-
         val.delta_score = ptr_val[1];
         val.show = ptr_val[2];
         val.clk = ptr_val[3];
@@ -185,7 +209,6 @@ void PSGPUWrapper::BuildTask(std::shared_ptr<HeterContext> gpu_task,
         val.lr = ptr_val[4];
         val.lr_g2sum = ptr_val[5];
         val.cpu_ptr = (uint64_t)(task_ptrs[dev][j]);
-
         if (dim > 7) {
           val.mf_size = MF_DIM + 1;
           for (int x = 0; x < val.mf_size; x++) {
@@ -198,7 +221,6 @@ void PSGPUWrapper::BuildTask(std::shared_ptr<HeterContext> gpu_task,
           }
         }
       }
-
       device_mutex[dev]->unlock();
     }
   };
@@ -206,6 +228,7 @@ void PSGPUWrapper::BuildTask(std::shared_ptr<HeterContext> gpu_task,
   for (size_t i = 0; i < threads.size(); i++) {
     threads[i] = std::thread(build_func, i);
   }
+
   for (std::thread& t : threads) {
     t.join();
   }
